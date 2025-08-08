@@ -3,7 +3,7 @@
 CSV→Video renderer
 
 Spec:
-- Input: CSV from stdin with header: time[ms], pitch, length[ms] (velocity ignored)
+- Input: CSV from stdin with header: time[ms], pitch, length[ms]; optional velocity
 - Behavior:
   - For each row, display `pitch` centered on screen starting at time[ms] for length[ms]
   - Texts may overlap; each line becomes an independent clip
@@ -23,17 +23,20 @@ Spec:
 Extended behavior (no overlap mode implemented):
 - Only one text is visible at any time
 - If a new group starts, the previous text is cut off immediately (even if its length remains)
-- If multiple notes share the same time, they are displayed side-by-side as "Ab1, C1" sorted by keyboard order
+- If multiple notes share the same time, they are displayed side-by-side sorted by keyboard order
+- Optional velocity-driven per-note font scaling: enable with `--dynamic-font-size lower:upper` (e.g., 0.6:1.6)
+  - Scaling uses min-max normalization over velocities winsorized to 5th–95th percentiles.
 """
 import argparse
 import csv
 import sys
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, cast
 
 from PIL import Image, ImageDraw, ImageFont, ImageColor
 from moviepy.editor import ImageClip, ColorClip, CompositeVideoClip, AudioFileClip
-from moviepy.video.fx import all as vfx
+from moviepy.video.fx.fadein import fadein
+from moviepy.video.fx.fadeout import fadeout
 import numpy as np
 
 
@@ -42,6 +45,7 @@ class NoteEvent:
     start_s: float
     duration_s: float
     pitch: str
+    velocity: Optional[int] = None
 
 
 def parse_size(text: str) -> Tuple[int, int]:
@@ -66,16 +70,32 @@ def parse_color(text: str) -> Tuple[int, int, int]:
         raise argparse.ArgumentTypeError(f"Invalid color '{text}'")
 
 
+def parse_dynamic_range(text: str) -> Tuple[float, float]:
+    try:
+        lower_str, upper_str = text.split(":", 1)
+        lower = float(lower_str)
+        upper = float(upper_str)
+        if not (0.1 <= lower <= 5.0 and 0.1 <= upper <= 5.0):
+            raise ValueError
+        if lower > upper:
+            raise ValueError
+        return lower, upper
+    except Exception:
+        raise argparse.ArgumentTypeError(
+            f"Invalid dynamic font size range '{text}', expected LOWER:UPPER (e.g., 0.6:1.6)"
+        )
+
+
 def resolve_font(font_name_or_path: Optional[str], font_size: int) -> ImageFont.ImageFont:
     if not font_name_or_path:
         try:
-            return ImageFont.truetype("Arial.ttf", font_size)  # type: ignore[return-value]
+            return cast(ImageFont.ImageFont, ImageFont.truetype("Arial.ttf", font_size))
         except Exception:
-            return ImageFont.load_default()
+            return cast(ImageFont.ImageFont, ImageFont.load_default())
 
     # Try as a direct file path first
     try:
-        return ImageFont.truetype(font_name_or_path, font_size)  # type: ignore[return-value]
+        return cast(ImageFont.ImageFont, ImageFont.truetype(font_name_or_path, font_size))
     except Exception:
         pass
 
@@ -106,15 +126,15 @@ def resolve_font(font_name_or_path: Optional[str], font_size: int) -> ImageFont.
 
     if candidates:
         try:
-            return ImageFont.truetype(candidates[0], font_size)  # type: ignore[return-value]
+            return cast(ImageFont.ImageFont, ImageFont.truetype(candidates[0], font_size))
         except Exception:
             pass
 
     # Fallbacks
     try:
-        return ImageFont.truetype("Arial.ttf", font_size)  # type: ignore[return-value]
+        return cast(ImageFont.ImageFont, ImageFont.truetype("Arial.ttf", font_size))
     except Exception:
-        return ImageFont.load_default()
+        return cast(ImageFont.ImageFont, ImageFont.load_default())
 
 
 def render_text_image(text: str, font: ImageFont.ImageFont, color: Tuple[int, int, int]) -> Image.Image:
@@ -144,6 +164,30 @@ def render_text_image(text: str, font: ImageFont.ImageFont, color: Tuple[int, in
     return img
 
 
+# Helper to horizontally stack images with vertical center alignment
+def hstack_images(images: List[Image.Image]) -> Image.Image:
+    if not images:
+        return Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+    total_w = sum(img.width for img in images)
+    max_h = max(img.height for img in images)
+    out = Image.new("RGBA", (total_w, max_h), (0, 0, 0, 0))
+    x = 0
+    for img in images:
+        y = (max_h - img.height) // 2
+        out.paste(img, (x, y), img)
+        x += img.width
+    return out
+
+
+# Clamp helper
+def clamp(value: float, lower: float, upper: float) -> float:
+    if value < lower:
+        return lower
+    if value > upper:
+        return upper
+    return value
+
+
 def read_events_from_stdin() -> List[NoteEvent]:
     reader = csv.DictReader(sys.stdin)
     required_columns = {"time[ms]", "pitch", "length[ms]"}
@@ -160,10 +204,55 @@ def read_events_from_stdin() -> List[NoteEvent]:
             pitch = str(row["pitch"]).strip()
             if duration_ms <= 0:
                 continue
-            events.append(NoteEvent(start_s=start_ms / 1000.0, duration_s=duration_ms / 1000.0, pitch=pitch))
+            vel: Optional[int] = None
+            if "velocity" in row and row["velocity"] is not None and str(row["velocity"]).strip() != "":
+                try:
+                    vel = int(float(row["velocity"]))
+                except Exception:
+                    vel = None
+            events.append(
+                NoteEvent(
+                    start_s=start_ms / 1000.0,
+                    duration_s=duration_ms / 1000.0,
+                    pitch=pitch,
+                    velocity=vel,
+                )
+            )
         except Exception:
             continue
     return events
+
+
+# Return groups with events preserved (no uniqueness filtering), still no-overlap between groups
+def group_events_no_overlap_with_events(events: List[NoteEvent]) -> List[Tuple[float, float, List[NoteEvent]]]:
+    # Group by integer millisecond start to avoid float equality issues
+    groups: Dict[int, List[NoteEvent]] = {}
+    for ev in events:
+        start_ms = int(round(ev.start_s * 1000))
+        groups.setdefault(start_ms, []).append(ev)
+
+    sorted_starts_ms = sorted(groups.keys())
+
+    grouped: List[Tuple[float, float, List[NoteEvent]]] = []
+    for i, start_ms in enumerate(sorted_starts_ms):
+        group_events = groups[start_ms]
+        # Preserve duplicates; sort by keyboard order (by MIDI), fallback to alpha
+        def sort_key(ev: NoteEvent) -> Tuple[int, str]:
+            m = pitch_to_midi(ev.pitch)
+            return (m if m is not None else 10_000, ev.pitch)
+        ordered_events = sorted(group_events, key=sort_key)
+
+        start_s = start_ms / 1000.0
+        intended_end_s = max(ev.start_s + ev.duration_s for ev in group_events)
+        if i + 1 < len(sorted_starts_ms):
+            next_start_s = sorted_starts_ms[i + 1] / 1000.0
+            end_s = min(intended_end_s, next_start_s)
+        else:
+            end_s = intended_end_s
+
+        if end_s > start_s:
+            grouped.append((start_s, end_s - start_s, ordered_events))
+    return grouped
 
 
 def pitch_to_midi(pitch: str) -> Optional[int]:
@@ -201,6 +290,7 @@ def pitch_to_midi(pitch: str) -> Optional[int]:
         return None
 
 
+# Original unique/grouped labels (kept for static-size rendering)
 def group_events_no_overlap(events: List[NoteEvent]) -> List[Tuple[float, float, str]]:
     # Group by integer millisecond start to avoid float equality issues
     groups: Dict[int, List[NoteEvent]] = {}
@@ -250,12 +340,14 @@ def build_video(
     text_color: Tuple[int, int, int],
     bgm_path: Optional[str],
     bgm_volume: float,
+    dynamic_scale_range: Optional[Tuple[float, float]] = None,
 ) -> None:
     width, height = size
     if font_size is None:
         font_size = max(12, int(height * 0.2))
 
-    font = resolve_font(font_name, font_size)
+    # Base font for static rendering and separators
+    base_font = resolve_font(font_name, font_size)
 
     # Compute base duration from events
     base_total_s = 0.0
@@ -278,20 +370,72 @@ def build_video(
 
     background = ColorClip(size, color=bg_color).set_duration(video_total_s)
 
-    # Generate non-overlapping grouped clips
-    groups = group_events_no_overlap(events)
+    # Determine whether dynamic scaling is enabled and compute min-max over winsorized velocities (5-95 pct)
+    dynamic_enabled = False
+    v_min: float = 0.0
+    v_max: float = 0.0
+    lower_upper: Tuple[float, float] = (0.0, 0.0)
+    if dynamic_scale_range is not None:
+        velocities = np.array([float(ev.velocity) for ev in events if ev.velocity is not None and ev.velocity > 0], dtype=float)
+        if velocities.size > 0:
+            p_low = 5.0
+            p_high = 95.0
+            v_min = float(np.percentile(velocities, p_low))
+            v_max = float(np.percentile(velocities, p_high))
+            dynamic_enabled = True
+            lower_upper = dynamic_scale_range
+        else:
+            print("Warning: --dynamic-font-size specified but no usable velocity values found; disabling dynamic scaling.", file=sys.stderr)
 
+    # Generate clips
     text_clips: List[ImageClip] = []
     fade_s_default = max(0.0, fade_ms / 1000.0)
 
-    for start_s, duration_s, label in groups:
-        text_img = render_text_image(label, font, text_color)
-        text_np = np.array(text_img)
-        clip = ImageClip(text_np).set_position("center").set_start(start_s).set_duration(duration_s)
-        fade_s = min(fade_s_default, duration_s / 2.0)
-        if fade_s > 0:
-            clip = clip.fx(vfx.fadein, fade_s).fx(vfx.fadeout, fade_s)
-        text_clips.append(clip)
+    if dynamic_enabled:
+        # Cache fonts by size to avoid repeated loading
+        font_cache: Dict[int, ImageFont.ImageFont] = {}
+        def get_font(sz: int) -> ImageFont.ImageFont:
+            if sz not in font_cache:
+                font_cache[sz] = resolve_font(font_name, sz)
+            return font_cache[sz]
+
+        groups = group_events_no_overlap_with_events(events)
+        for start_s, duration_s, group_events in groups:
+            images: List[Image.Image] = []
+            for idx, ev in enumerate(group_events):
+                ratio = 1.0
+                if ev.velocity is not None and v_max > v_min:
+                    val = float(ev.velocity)
+                    if val < v_min:
+                        val = v_min
+                    elif val > v_max:
+                        val = v_max
+                    t = (val - v_min) / (v_max - v_min)
+                    lower, upper = lower_upper
+                    ratio = lower + t * (upper - lower)
+                sz = max(1, int(round(font_size * ratio)))
+                font_i = get_font(sz)
+                images.append(render_text_image(ev.pitch, font_i, text_color))
+                if idx + 1 < len(group_events):
+                    images.append(render_text_image(", ", base_font, text_color))
+            text_img = hstack_images(images)
+            text_np = np.array(text_img)
+            clip = ImageClip(text_np).set_position("center").set_start(start_s).set_duration(duration_s)
+            fade_s = min(fade_s_default, duration_s / 2.0)
+            if fade_s > 0:
+                clip = clip.fx(fadein, fade_s).fx(fadeout, fade_s)
+            text_clips.append(clip)
+    else:
+        # Static-size rendering: unique pitches joined by comma
+        groups = group_events_no_overlap(events)
+        for start_s, duration_s, label in groups:
+            text_img = render_text_image(label, base_font, text_color)
+            text_np = np.array(text_img)
+            clip = ImageClip(text_np).set_position("center").set_start(start_s).set_duration(duration_s)
+            fade_s = min(fade_s_default, duration_s / 2.0)
+            if fade_s > 0:
+                clip = clip.fx(fadein, fade_s).fx(fadeout, fade_s)
+            text_clips.append(clip)
 
     composite = CompositeVideoClip([background, *text_clips], size=size)
 
@@ -336,12 +480,21 @@ def main():
     parser.add_argument("--text-color", type=parse_color, default="#FFFFFF", help="Text color (default: #FFFFFF)")
     parser.add_argument("--bgm", default=None, help="Optional background audio path (e.g., .mp3)")
     parser.add_argument("--bgm-volume", type=float, default=1.0, help="BGM volume multiplier (default: 1.0)")
+    parser.add_argument(
+        "--dynamic-font-size",
+        default=None,
+        help="Enable per-note velocity scaling with LOWER:UPPER (e.g., 0.6:1.6). If omitted, feature is disabled.",
+    )
 
     args = parser.parse_args()
 
     events = read_events_from_stdin()
     if not events:
         raise SystemExit("No events parsed from stdin.")
+
+    dynamic_range: Optional[Tuple[float, float]] = None
+    if args.dynamic_font_size is not None:
+        dynamic_range = parse_dynamic_range(args.dynamic_font_size)
 
     build_video(
         events=events,
@@ -356,6 +509,7 @@ def main():
         text_color=args.text_color,
         bgm_path=args.bgm,
         bgm_volume=args.bgm_volume,
+        dynamic_scale_range=dynamic_range,
     )
 
 
