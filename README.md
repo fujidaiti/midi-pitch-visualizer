@@ -1,11 +1,18 @@
-# midi-pitch-visualizer
-
 <img src="res/screenshot.png" alt="screenshot" width="360" />
+
+# midi-pitch-visualizer
 
 A tiny toolkit to turn a melody in a MIDI file into a text-overlay practice video for the [Otamatone](https://otamatone.jp).
 
 - `midi_to_csv.py`: Parse a single-track MIDI and print a CSV of note events to stdout.
 - `csv_to_video.py`: Read the CSV from stdin and render an MP4 showing pitch names centered on screen at the right times.
+
+<video width="480" controls>
+  <source src="res/example_output_with_bgm.mp4" type="video/mp4">
+  Your browser does not support the video tag.
+</video>
+
+*Example output: MIDI melody converted to pitch name overlay video*
 
 ## Requirements
 
